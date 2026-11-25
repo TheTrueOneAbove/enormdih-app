@@ -22,12 +22,12 @@ import android.widget.ScrollView
 import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import android.webkit.JavascriptInterface
+import android.webkit.WebView
+import android.webkit.WebViewClient
 import org.json.JSONObject
-import java.net.HttpURLConnection
-import java.net.URL
 import java.net.URLEncoder
 import java.util.Locale
-import kotlin.concurrent.thread
 
 class MainActivity : Activity(), TextToSpeech.OnInitListener {
 
@@ -89,56 +89,100 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         t.speak(text, mode, null, "utt-${System.nanoTime()}")
     }
 
-    // ---------- Google Directions (uses the user's own API key) ----------
+    // ---------- Google Maps (map view + directions, uses the user's own API key) ----------
 
-    private fun fetchDirections(key: String, origin: String, destination: String) {
-        if (key.isBlank()) { toast("Add your Google API key first"); return }
-        if (origin.isBlank() || destination.isBlank()) { toast("Enter a start and a destination"); return }
-        directionsOutput.text = "Getting directions..."
-        thread {
-            val result: Result<Pair<String, List<String>>> = runCatching {
-                val url = "https://maps.googleapis.com/maps/api/directions/json" +
-                    "?origin=${enc(origin)}&destination=${enc(destination)}&mode=driving&key=${enc(key)}"
-                val conn = URL(url).openConnection() as HttpURLConnection
-                conn.connectTimeout = 15000
-                conn.readTimeout = 15000
-                val body = try {
-                    conn.inputStream.bufferedReader().use { it.readText() }
-                } finally {
-                    conn.disconnect()
-                }
-                val json = JSONObject(body)
-                val status = json.optString("status")
-                if (status != "OK") {
-                    val msg = json.optString("error_message").ifBlank { status }
-                    error(msg)
-                }
-                val leg = json.getJSONArray("routes").getJSONObject(0)
-                    .getJSONArray("legs").getJSONObject(0)
-                val summary = "Right. Route to ${leg.optString("end_address", destination)}. " +
-                    "${leg.getJSONObject("distance").optString("text")}, " +
-                    "about ${leg.getJSONObject("duration").optString("text")}."
-                val steps = leg.getJSONArray("steps")
-                val lines = (0 until steps.length()).map { i ->
-                    val s = steps.getJSONObject(i)
-                    val instr = Html.fromHtml(s.optString("html_instructions"), Html.FROM_HTML_MODE_LEGACY)
-                        .toString().trim()
-                    val dist = s.optJSONObject("distance")?.optString("text").orEmpty()
-                    if (dist.isBlank()) instr else "$instr, for $dist"
-                }
-                summary to lines
-            }
+    private lateinit var mapView: WebView
+    private var loadedKey: String? = null
+
+    private val mapHtml = """
+<!DOCTYPE html><html><head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>html,body,#m{margin:0;height:100%;background:#000}</style></head><body>
+<div id="m"></div>
+<script>
+var map, ds, dr, pending = null;
+var DARK = [
+ {elementType:'geometry',stylers:[{color:'#000000'}]},
+ {elementType:'labels.text.fill',stylers:[{color:'#8a8a8a'}]},
+ {elementType:'labels.text.stroke',stylers:[{color:'#000000'}]},
+ {featureType:'road',elementType:'geometry',stylers:[{color:'#1c1c1c'}]},
+ {featureType:'water',elementType:'geometry',stylers:[{color:'#0a0f14'}]},
+ {featureType:'poi',stylers:[{visibility:'off'}]}
+];
+function initMap(){
+  map = new google.maps.Map(document.getElementById('m'),
+    {center:{lat:39.5,lng:-98.35},zoom:4,disableDefaultUI:true,zoomControl:true,styles:DARK});
+  ds = new google.maps.DirectionsService();
+  dr = new google.maps.DirectionsRenderer({map:map,polylineOptions:{strokeColor:'#FF3B30',strokeWeight:5}});
+  if (pending) { route(pending[0], pending[1]); pending = null; }
+}
+function route(o, d){
+  if (!ds) { pending = [o, d]; return; }
+  ds.route({origin:o,destination:d,travelMode:'DRIVING'}, function(r, s){
+    if (s === 'OK') {
+      dr.setDirections(r);
+      var l = r.routes[0].legs[0];
+      var steps = l.steps.map(function(x){ return {t:x.instructions, d:x.distance.text}; });
+      Android.onRoute(JSON.stringify({end:l.end_address,dist:l.distance.text,dur:l.duration.text,steps:steps}));
+    } else { Android.onError('Directions failed: ' + s); }
+  });
+}
+window.gm_authFailure = function(){ Android.onError('Google rejected the API key. Check the key and that Maps JavaScript API and Directions API are enabled.'); };
+</script>
+<script src="https://maps.googleapis.com/maps/api/js?key=__KEY__&callback=initMap" async defer></script>
+</body></html>
+""".trimIndent()
+
+    private inner class Bridge {
+        @JavascriptInterface
+        fun onRoute(json: String) {
             runOnUiThread {
-                result.onSuccess { (summary, lines) ->
+                runCatching {
+                    val j = JSONObject(json)
+                    val summary = "Right. Route to ${j.optString("end")}. " +
+                        "${j.optString("dist")}, about ${j.optString("dur")}."
+                    val steps = j.getJSONArray("steps")
+                    val lines = (0 until steps.length()).map { i ->
+                        val st = steps.getJSONObject(i)
+                        val instr = Html.fromHtml(st.optString("t"), Html.FROM_HTML_MODE_LEGACY).toString().trim()
+                        val dist = st.optString("d")
+                        if (dist.isBlank()) instr else "$instr, for $dist"
+                    }
                     directionsOutput.text = (listOf(summary) + lines.mapIndexed { i, l -> "${i + 1}. $l" })
                         .joinToString("\n")
                     speak(summary)
                     lines.forEach { speak(it, queue = true) }
-                }.onFailure {
-                    directionsOutput.text = "Error: ${it.message}"
-                    speak("That's not right. Check your key and try again.")
+                }.onFailure { directionsOutput.text = "Error: ${it.message}" }
+            }
+        }
+
+        @JavascriptInterface
+        fun onError(message: String) {
+            runOnUiThread {
+                directionsOutput.text = "Error: $message"
+                speak("That's not right. Check your key and try again.")
+            }
+        }
+    }
+
+    private fun showRoute(key: String, origin: String, destination: String) {
+        if (key.isBlank()) { toast("Add your Google API key first"); return }
+        if (origin.isBlank() || destination.isBlank()) { toast("Enter a start and a destination"); return }
+        directionsOutput.text = "Getting directions..."
+        val call = "route(${JSONObject.quote(origin)},${JSONObject.quote(destination)})"
+        if (loadedKey != key) {
+            loadedKey = key
+            mapView.webViewClient = object : WebViewClient() {
+                override fun onPageFinished(view: WebView?, url: String?) {
+                    view?.evaluateJavascript(call, null)
                 }
             }
+            mapView.loadDataWithBaseURL(
+                "https://maps.local/", mapHtml.replace("__KEY__", enc(key)),
+                "text/html", "utf-8", null
+            )
+        } else {
+            mapView.evaluateJavascript(call, null)
         }
     }
 
@@ -192,7 +236,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         // --- Maps section
         col.addView(sectionTitle("MAPS (OPTIONAL)"))
         col.addView(label(
-            "Add your own Google API key (Directions API enabled) to hear spoken directions.",
+            "Add your own Google API key (Maps JavaScript API and Directions API enabled) to see the map and hear spoken directions. Don't restrict the key by HTTP referrer.",
             12f, Color.parseColor(MUTED)
         ))
         val keyField = edit("Google API key", password = true)
@@ -205,13 +249,23 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         col.addView(from)
         col.addView(to)
 
-        col.addView(primaryButton("GET SPOKEN DIRECTIONS") {
+        mapView = WebView(this).apply {
+            settings.javaScriptEnabled = true
+            settings.domStorageEnabled = true
+            setBackgroundColor(Color.BLACK)
+            addJavascriptInterface(Bridge(), "Android")
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(340))
+                .apply { topMargin = dp(12) }
+        }
+        col.addView(mapView)
+
+        col.addView(primaryButton("SHOW ROUTE & SPEAK DIRECTIONS") {
             prefs.edit()
                 .putString("apikey", keyField.text.toString().trim())
                 .putString("from", from.text.toString())
                 .putString("to", to.text.toString())
                 .apply()
-            fetchDirections(keyField.text.toString().trim(), from.text.toString().trim(), to.text.toString().trim())
+            showRoute(keyField.text.toString().trim(), from.text.toString().trim(), to.text.toString().trim())
         })
         col.addView(ghostButton("OPEN IN GOOGLE MAPS") {
             val dest = to.text.toString().trim()
