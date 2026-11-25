@@ -1,74 +1,329 @@
 package com.example.enormdih
 
 import android.app.Activity
+import android.content.Intent
+import android.content.SharedPreferences
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
+import android.text.Html
+import android.text.InputType
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
 import java.util.Locale
+import kotlin.concurrent.thread
 
 class MainActivity : Activity(), TextToSpeech.OnInitListener {
 
+    private companion object {
+        const val BG = "#000000"        // true black for OLED
+        const val SURFACE = "#0B0B0B"
+        const val BORDER = "#202020"
+        const val ACCENT = "#FF3B30"
+        const val MUTED = "#7A7A7A"
+    }
+
     private var tts: TextToSpeech? = null
     private var ready = false
+    private lateinit var prefs: SharedPreferences
+
+    // Voice settings (a gruff, fast, deep British "chef" style preset)
+    private var pitch = 0.80f
+    private var rate = 1.15f
+
+    private lateinit var directionsOutput: TextView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        prefs = getSharedPreferences("settings", MODE_PRIVATE)
+        pitch = prefs.getFloat("pitch", pitch)
+        rate = prefs.getFloat("rate", rate)
         tts = TextToSpeech(this, this)
-
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setBackgroundColor(Color.parseColor("#101820"))
-            setPadding(48, 48, 48, 48)
-        }
-
-        val title = TextView(this).apply {
-            text = "ENORMDIH"
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 36f)
-            typeface = Typeface.DEFAULT_BOLD
-            gravity = Gravity.CENTER
-        }
-
-        val button = Button(this).apply {
-            text = "PLAY"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 28f)
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#E63946"))
-            setOnClickListener { speak() }
-        }
-        val lp = LinearLayout.LayoutParams(720, 360).apply { topMargin = 96 }
-
-        root.addView(title)
-        root.addView(button, lp)
-        setContentView(root)
+        buildUi()
     }
+
+    // ---------- Text to speech ----------
 
     override fun onInit(status: Int) {
-        if (status == TextToSpeech.SUCCESS) {
-            tts?.language = Locale.US
-            tts?.setSpeechRate(0.8f)
-            tts?.setPitch(0.6f) // deep voice
-            ready = true
-        } else {
-            Toast.makeText(this, "Text-to-speech not available", Toast.LENGTH_LONG).show()
+        val t = tts
+        if (status != TextToSpeech.SUCCESS || t == null) {
+            toast("Text-to-speech not available")
+            return
+        }
+        t.language = Locale.UK
+        // Prefer an on-device British male voice if the engine has one.
+        val british = t.voices?.filter {
+            it.locale.language == "en" && it.locale.country == "GB" && !it.isNetworkConnectionRequired
+        }.orEmpty()
+        val pick = british.firstOrNull { it.name.contains("-gbd-") || it.name.contains("-gbb-") }
+            ?: british.firstOrNull()
+        if (pick != null) t.voice = pick
+        ready = true
+    }
+
+    private fun speak(text: String, queue: Boolean = false) {
+        val t = tts
+        if (!ready || t == null) {
+            toast("Voice still loading, try again")
+            return
+        }
+        t.setPitch(pitch)
+        t.setSpeechRate(rate)
+        val mode = if (queue) TextToSpeech.QUEUE_ADD else TextToSpeech.QUEUE_FLUSH
+        t.speak(text, mode, null, "utt-${System.nanoTime()}")
+    }
+
+    // ---------- Google Directions (uses the user's own API key) ----------
+
+    private fun fetchDirections(key: String, origin: String, destination: String) {
+        if (key.isBlank()) { toast("Add your Google API key first"); return }
+        if (origin.isBlank() || destination.isBlank()) { toast("Enter a start and a destination"); return }
+        directionsOutput.text = "Getting directions..."
+        thread {
+            val result: Result<Pair<String, List<String>>> = runCatching {
+                val url = "https://maps.googleapis.com/maps/api/directions/json" +
+                    "?origin=${enc(origin)}&destination=${enc(destination)}&mode=driving&key=${enc(key)}"
+                val conn = URL(url).openConnection() as HttpURLConnection
+                conn.connectTimeout = 15000
+                conn.readTimeout = 15000
+                val body = try {
+                    conn.inputStream.bufferedReader().use { it.readText() }
+                } finally {
+                    conn.disconnect()
+                }
+                val json = JSONObject(body)
+                val status = json.optString("status")
+                if (status != "OK") {
+                    val msg = json.optString("error_message").ifBlank { status }
+                    error(msg)
+                }
+                val leg = json.getJSONArray("routes").getJSONObject(0)
+                    .getJSONArray("legs").getJSONObject(0)
+                val summary = "Right. Route to ${leg.optString("end_address", destination)}. " +
+                    "${leg.getJSONObject("distance").optString("text")}, " +
+                    "about ${leg.getJSONObject("duration").optString("text")}."
+                val steps = leg.getJSONArray("steps")
+                val lines = (0 until steps.length()).map { i ->
+                    val s = steps.getJSONObject(i)
+                    val instr = Html.fromHtml(s.optString("html_instructions"), Html.FROM_HTML_MODE_LEGACY)
+                        .toString().trim()
+                    val dist = s.optJSONObject("distance")?.optString("text").orEmpty()
+                    if (dist.isBlank()) instr else "$instr, for $dist"
+                }
+                summary to lines
+            }
+            runOnUiThread {
+                result.onSuccess { (summary, lines) ->
+                    directionsOutput.text = (listOf(summary) + lines.mapIndexed { i, l -> "${i + 1}. $l" })
+                        .joinToString("\n")
+                    speak(summary)
+                    lines.forEach { speak(it, queue = true) }
+                }.onFailure {
+                    directionsOutput.text = "Error: ${it.message}"
+                    speak("That's not right. Check your key and try again.")
+                }
+            }
         }
     }
 
-    private fun speak() {
-        if (!ready) {
-            Toast.makeText(this, "Voice still loading, try again", Toast.LENGTH_SHORT).show()
-            return
+    private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
+
+    // ---------- UI ----------
+
+    private fun buildUi() {
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(28), dp(20), dp(40))
         }
-        tts?.speak("enormdih", TextToSpeech.QUEUE_FLUSH, null, "enormdih")
+        val scroll = ScrollView(this).apply {
+            setBackgroundColor(Color.parseColor(BG))
+            isFillViewport = true
+            addView(col)
+        }
+        setContentView(scroll)
+
+        col.addView(label("CHEF SPEAK", 30f, Color.WHITE, bold = true))
+        col.addView(label("Text to speech, served hot.", 14f, Color.parseColor(MUTED)).also { gap(it, 4, 24) })
+
+        // --- Text to speech section
+        col.addView(sectionTitle("SAY IT"))
+        val input = edit("Type something to say...", multiline = true)
+        input.setText(prefs.getString("text", "This is raw! Get it back in the oven!"))
+        col.addView(input)
+
+        val speakBtn = primaryButton("SPEAK") {
+            prefs.edit().putString("text", input.text.toString()).apply()
+            val t = input.text.toString().trim()
+            if (t.isNotEmpty()) speak(t)
+        }
+        col.addView(speakBtn)
+        col.addView(ghostButton("STOP") { tts?.stop() })
+
+        // --- Voice section
+        col.addView(sectionTitle("VOICE"))
+        col.addView(slider("Pitch", pitch, 0.5f, 1.5f) { v ->
+            pitch = v; prefs.edit().putFloat("pitch", v).apply()
+        })
+        col.addView(slider("Speed", rate, 0.5f, 2.0f) { v ->
+            rate = v; prefs.edit().putFloat("rate", v).apply()
+        })
+        col.addView(label(
+            "Uses a British voice from your phone's text-to-speech engine. " +
+                "For the best result, install Google Speech Services and pick a British male voice.",
+            12f, Color.parseColor(MUTED)
+        ).also { gap(it, 4, 0) })
+
+        // --- Maps section
+        col.addView(sectionTitle("MAPS (OPTIONAL)"))
+        col.addView(label(
+            "Add your own Google API key (Directions API enabled) to hear spoken directions.",
+            12f, Color.parseColor(MUTED)
+        ))
+        val keyField = edit("Google API key", password = true)
+        keyField.setText(prefs.getString("apikey", ""))
+        col.addView(keyField)
+        val from = edit("From (address or place)")
+        val to = edit("To (address or place)")
+        from.setText(prefs.getString("from", ""))
+        to.setText(prefs.getString("to", ""))
+        col.addView(from)
+        col.addView(to)
+
+        col.addView(primaryButton("GET SPOKEN DIRECTIONS") {
+            prefs.edit()
+                .putString("apikey", keyField.text.toString().trim())
+                .putString("from", from.text.toString())
+                .putString("to", to.text.toString())
+                .apply()
+            fetchDirections(keyField.text.toString().trim(), from.text.toString().trim(), to.text.toString().trim())
+        })
+        col.addView(ghostButton("OPEN IN GOOGLE MAPS") {
+            val dest = to.text.toString().trim()
+            if (dest.isEmpty()) {
+                toast("Enter a destination")
+            } else {
+                try {
+                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("google.navigation:q=${enc(dest)}")))
+                } catch (e: Exception) {
+                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/maps/search/?api=1&query=${enc(dest)}")))
+                }
+            }
+        })
+
+        directionsOutput = label("", 14f, Color.WHITE).also { gap(it, 16, 0) }
+        col.addView(directionsOutput)
     }
+
+    private fun dp(v: Int) = TypedValue.applyDimension(
+        TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics
+    ).toInt()
+
+    private fun gap(v: View, top: Int, bottom: Int) {
+        val lp = (v.layoutParams as? LinearLayout.LayoutParams)
+            ?: LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        lp.topMargin = dp(top); lp.bottomMargin = dp(bottom)
+        v.layoutParams = lp
+    }
+
+    private fun label(text: String, sp: Float, color: Int, bold: Boolean = false) = TextView(this).apply {
+        this.text = text
+        setTextColor(color)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, sp)
+        if (bold) typeface = Typeface.DEFAULT_BOLD
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+    }
+
+    private fun sectionTitle(text: String) = label(text, 12f, Color.parseColor(ACCENT), bold = true).also {
+        it.letterSpacing = 0.15f
+        gap(it, 32, 10)
+    }
+
+    private fun box(): GradientDrawable = GradientDrawable().apply {
+        setColor(Color.parseColor(SURFACE))
+        cornerRadius = dp(14).toFloat()
+        setStroke(dp(1), Color.parseColor(BORDER))
+    }
+
+    private fun edit(hint: String, multiline: Boolean = false, password: Boolean = false) = EditText(this).apply {
+        this.hint = hint
+        setHintTextColor(Color.parseColor("#555555"))
+        setTextColor(Color.WHITE)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+        background = box()
+        setPadding(dp(14), dp(12), dp(14), dp(12))
+        inputType = when {
+            password -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            multiline -> InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE or InputType.TYPE_TEXT_FLAG_CAP_SENTENCES
+            else -> InputType.TYPE_CLASS_TEXT
+        }
+        if (multiline) { minLines = 4; gravity = Gravity.TOP }
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            .apply { topMargin = dp(8) }
+    }
+
+    private fun primaryButton(text: String, onClick: () -> Unit) = Button(this).apply {
+        this.text = text
+        setTextColor(Color.WHITE)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+        typeface = Typeface.DEFAULT_BOLD
+        stateListAnimator = null
+        background = GradientDrawable().apply {
+            setColor(Color.parseColor(ACCENT)); cornerRadius = dp(14).toFloat()
+        }
+        setOnClickListener { onClick() }
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(54)).apply { topMargin = dp(12) }
+    }
+
+    private fun ghostButton(text: String, onClick: () -> Unit) = Button(this).apply {
+        this.text = text
+        setTextColor(Color.WHITE)
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+        stateListAnimator = null
+        background = box()
+        setOnClickListener { onClick() }
+        layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(50)).apply { topMargin = dp(8) }
+    }
+
+    private fun slider(name: String, initial: Float, min: Float, max: Float, onChange: (Float) -> Unit): View {
+        val wrap = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val title = label("$name: ${"%.2f".format(initial)}", 14f, Color.WHITE)
+        val steps = 100
+        val bar = SeekBar(this).apply {
+            this.max = steps
+            progress = (((initial - min) / (max - min)) * steps).toInt().coerceIn(0, steps)
+            setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                    val v = min + (max - min) * p / steps
+                    title.text = "$name: ${"%.2f".format(v)}"
+                    if (fromUser) onChange(v)
+                }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+            })
+        }
+        wrap.addView(title)
+        wrap.addView(bar)
+        gap(wrap, 8, 0)
+        return wrap
+    }
+
+    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 
     override fun onDestroy() {
         tts?.stop()
