@@ -4,6 +4,14 @@ import android.app.Activity
 import android.content.Intent
 import android.content.SharedPreferences
 import android.graphics.Color
+import android.media.MediaPlayer
+import android.util.Base64
+import android.text.Editable
+import android.text.TextWatcher
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import kotlin.concurrent.thread
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
@@ -54,39 +62,150 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         prefs = getSharedPreferences("settings", MODE_PRIVATE)
         pitch = prefs.getFloat("pitch", pitch)
         rate = prefs.getFloat("rate", rate)
-        tts = TextToSpeech(this, this)
         buildUi()
+        initTts(preferGoogle = true)
     }
 
-    // ---------- Text to speech ----------
+    // ---------- Voice: Google Cloud voice (built in, uses your key) or the phone's engine ----------
+
+    private var player: MediaPlayer? = null
+    private lateinit var statusView: TextView
+    private lateinit var sourceBtn: Button
+
+    private fun cloudKey() = prefs.getString("apikey", "").orEmpty().trim()
+    private fun useCloud() = cloudKey().isNotEmpty() && prefs.getBoolean("cloud", true)
+
+    private fun setStatus(msg: String) {
+        if (::statusView.isInitialized) statusView.text = msg
+    }
+
+    private fun refreshStatus() {
+        setStatus(
+            when {
+                useCloud() -> "Voice: Google Cloud (British male). Needs internet."
+                ready -> "Voice: phone text-to-speech engine."
+                else -> "No voice yet. Add a Google API key below (enable Cloud Text-to-Speech API), " +
+                    "or tap INSTALL PHONE VOICE ENGINE."
+            }
+        )
+        if (::sourceBtn.isInitialized) {
+            sourceBtn.text = if (prefs.getBoolean("cloud", true)) "SOURCE: GOOGLE CLOUD (TAP TO SWITCH)" else "SOURCE: PHONE ENGINE (TAP TO SWITCH)"
+        }
+    }
+
+    private fun initTts(preferGoogle: Boolean) {
+        ready = false
+        tts?.shutdown()
+        val hasGoogle = runCatching { packageManager.getPackageInfo("com.google.android.tts", 0); true }.getOrDefault(false)
+        usedGoogleEngine = preferGoogle && hasGoogle
+        tts = if (usedGoogleEngine) TextToSpeech(this, this, "com.google.android.tts") else TextToSpeech(this, this)
+    }
+
+    private var usedGoogleEngine = false
 
     override fun onInit(status: Int) {
         val t = tts
         if (status != TextToSpeech.SUCCESS || t == null) {
-            toast("Text-to-speech not available")
+            if (usedGoogleEngine) { initTts(preferGoogle = false); return }
+            ready = false
+            runOnUiThread { refreshStatus() }
             return
         }
         t.language = Locale.UK
-        // Prefer an on-device British male voice if the engine has one.
-        val british = t.voices?.filter {
-            it.locale.language == "en" && it.locale.country == "GB" && !it.isNetworkConnectionRequired
-        }.orEmpty()
+        val british = runCatching {
+            t.voices?.filter { it.locale.language == "en" && it.locale.country == "GB" && !it.isNetworkConnectionRequired }
+        }.getOrNull().orEmpty()
         val pick = british.firstOrNull { it.name.contains("-gbd-") || it.name.contains("-gbb-") }
             ?: british.firstOrNull()
         if (pick != null) t.voice = pick
         ready = true
+        runOnUiThread { refreshStatus() }
     }
 
     private fun speak(text: String, queue: Boolean = false) {
+        if (useCloud()) { cloudSpeak(text); return }
+        deviceSpeak(text, queue)
+    }
+
+    private fun speakAll(parts: List<String>) {
+        if (useCloud()) { cloudSpeak(parts.joinToString(". ")); return }
+        parts.forEachIndexed { i, p -> deviceSpeak(p, queue = i > 0) }
+    }
+
+    private fun deviceSpeak(text: String, queue: Boolean) {
         val t = tts
         if (!ready || t == null) {
-            toast("Voice still loading, try again")
+            refreshStatus()
+            toast("No phone voice engine. Add a Google API key or install one.")
             return
         }
         t.setPitch(pitch)
         t.setSpeechRate(rate)
         val mode = if (queue) TextToSpeech.QUEUE_ADD else TextToSpeech.QUEUE_FLUSH
         t.speak(text, mode, null, "utt-${System.nanoTime()}")
+    }
+
+    private fun cloudSpeak(text: String) {
+        val key = cloudKey()
+        setStatus("Preparing audio...")
+        thread {
+            val result = runCatching {
+                val body = JSONObject()
+                    .put("input", JSONObject().put("text", text.take(4500)))
+                    .put("voice", JSONObject().put("languageCode", "en-GB").put("name", "en-GB-Neural2-D"))
+                    .put(
+                        "audioConfig", JSONObject()
+                            .put("audioEncoding", "MP3")
+                            .put("speakingRate", rate.toDouble().coerceIn(0.25, 4.0))
+                            .put("pitch", ((pitch - 1f) * 20f).toDouble().coerceIn(-20.0, 20.0))
+                    )
+                val conn = URL("https://texttospeech.googleapis.com/v1/text:synthesize?key=${enc(key)}")
+                    .openConnection() as HttpURLConnection
+                conn.connectTimeout = 15000
+                conn.readTimeout = 30000
+                conn.requestMethod = "POST"
+                conn.doOutput = true
+                conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                try {
+                    conn.outputStream.use { it.write(body.toString().toByteArray()) }
+                    val code = conn.responseCode
+                    val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                    val resp = stream.bufferedReader().use { it.readText() }
+                    if (code !in 200..299) {
+                        error(runCatching { JSONObject(resp).getJSONObject("error").getString("message") }
+                            .getOrDefault("HTTP $code"))
+                    }
+                    val audio = Base64.decode(JSONObject(resp).getString("audioContent"), Base64.DEFAULT)
+                    File(cacheDir, "tts-${System.nanoTime()}.mp3").also { it.writeBytes(audio) }
+                } finally {
+                    conn.disconnect()
+                }
+            }
+            runOnUiThread {
+                result.onSuccess { f ->
+                    refreshStatus()
+                    play(f)
+                }.onFailure { e ->
+                    setStatus("Cloud voice error: ${e.message}")
+                    if (ready) deviceSpeak(text, queue = false)
+                }
+            }
+        }
+    }
+
+    private fun play(f: File) {
+        runCatching { player?.release() }
+        player = MediaPlayer().apply {
+            setDataSource(f.path)
+            setOnCompletionListener { f.delete() }
+            prepare()
+            start()
+        }
+    }
+
+    private fun stopAll() {
+        tts?.stop()
+        runCatching { player?.stop() }
     }
 
     // ---------- Google Maps (map view + directions, uses the user's own API key) ----------
@@ -150,8 +269,7 @@ window.gm_authFailure = function(){ Android.onError('Google rejected the API key
                     }
                     directionsOutput.text = (listOf(summary) + lines.mapIndexed { i, l -> "${i + 1}. $l" })
                         .joinToString("\n")
-                    speak(summary)
-                    lines.forEach { speak(it, queue = true) }
+                    speakAll(listOf(summary) + lines)
                 }.onFailure { directionsOutput.text = "Error: ${it.message}" }
             }
         }
@@ -217,10 +335,26 @@ window.gm_authFailure = function(){ Android.onError('Google rejected the API key
             if (t.isNotEmpty()) speak(t)
         }
         col.addView(speakBtn)
-        col.addView(ghostButton("STOP") { tts?.stop() })
+        col.addView(ghostButton("STOP") { stopAll() })
 
         // --- Voice section
         col.addView(sectionTitle("VOICE"))
+        statusView = label("", 13f, Color.WHITE)
+        col.addView(statusView)
+        sourceBtn = ghostButton("") {
+            prefs.edit().putBoolean("cloud", !prefs.getBoolean("cloud", true)).apply()
+            refreshStatus()
+        }
+        col.addView(sourceBtn)
+        col.addView(ghostButton("INSTALL PHONE VOICE ENGINE") {
+            try {
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("market://details?id=com.google.android.tts")))
+            } catch (e: Exception) {
+                startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=com.google.android.tts")))
+            }
+        })
+        col.addView(ghostButton("RETRY PHONE VOICE") { initTts(preferGoogle = true) })
+        refreshStatus()
         col.addView(slider("Pitch", pitch, 0.5f, 1.5f) { v ->
             pitch = v; prefs.edit().putFloat("pitch", v).apply()
         })
@@ -241,6 +375,14 @@ window.gm_authFailure = function(){ Android.onError('Google rejected the API key
         ))
         val keyField = edit("Google API key", password = true)
         keyField.setText(prefs.getString("apikey", ""))
+        keyField.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(c: CharSequence?, a: Int, b: Int, d: Int) {}
+            override fun onTextChanged(c: CharSequence?, a: Int, b: Int, d: Int) {}
+            override fun afterTextChanged(e: Editable?) {
+                prefs.edit().putString("apikey", e.toString().trim()).apply()
+                refreshStatus()
+            }
+        })
         col.addView(keyField)
         val from = edit("From (address or place)")
         val to = edit("To (address or place)")
@@ -382,6 +524,7 @@ window.gm_authFailure = function(){ Android.onError('Google rejected the API key
     override fun onDestroy() {
         tts?.stop()
         tts?.shutdown()
+        runCatching { player?.release() }
         super.onDestroy()
     }
 }
